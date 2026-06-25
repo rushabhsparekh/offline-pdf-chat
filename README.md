@@ -8,7 +8,7 @@ Built for engineers, analysts, and researchers who work with documents they cann
 
 ## Demo
 
-*[Add screenshot or screen recording here]*
+<img width="1897" height="881" alt="{28AFFC81-1E6E-470E-A96D-EDE0890D0FD5}" src="https://github.com/user-attachments/assets/f46a44e4-17c1-496a-a849-c12a59c7d33f" />
 
 ---
 
