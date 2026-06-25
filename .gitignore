@@ -1,0 +1,11 @@
+qdrant_storage/
+chunks/
+pdfs/
+models/
+chat_logs/
+__pycache__/
+*.pyc
+.env
+doc_registry.json
+resources/
+trial/

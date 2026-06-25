@@ -1,0 +1,506 @@
+ 
+Day1: Drawn the schematic flow diagram of "offline LLM with document RAG" on paper as follow
+[PDF files] -> [Extract text] -> [Split into chunks] -> [convert chunks into number (Embedding)] -> [Stores the number in vector database]
+[User question] -> [Convert into numbers] -> [search similar number from the database] -> [get top 3 chunks] -> [send top 3 chunks] -> [send chunks + user question to LLM] -> [Get the answer]
+Installed required libraries for this, ollama, pypdf, qdrand-client, numpy, streamlit. Downloaded qwen2.5:1.5b model from ollama. 
+Created directories with cmd using "cd" and "mkdir" and files using echo. > *.*
+Moreover, Discovered ollama help command, diagnosed AMD Readon RX560x Vulkan workaround, set OLLAMA_VULKAN=1, confirmed GPU acceleration working. Response speed significantly faster
+
+Day2: Wrote python script 01_chunk.py to extract text from pdf and split them into overlapping chunks.
+I have done experiment with different chunk size and overlap as below
+chunk size = 500 and overlap = 50, than total 43 chunks created
+chunk size = 300 and overlap = 30 than total 68 chunks created
+chunk size = 500 and overlap = 0 than total 40 chunks created, here I noticed that sentences are getting cut in from middle and due to no overlap ful sentence never captured in the chunk, which loses the context. 
+In my opinion for the a technical document chunk size = 500 and overlap = 100 is a good combination, because with 500 charectares the chunk will get enough context and with 100 overlap sentence which got cut earlier will make sense in next chunk. 
+
+Discovery: Fixed chunking breaks paragraph context.
+Solution: Paragraph-aware chunking using \n\n as boundary.
+
+independently discovered that fixed-size chunking loses paragraph context. This is called 
+semantic chunking problem. Real RAG systems solve this with embedding-based boundary detection.
+
+my analysis on the text extracted
+- First of all I can not see double enter (\n\n) anywhere
+- when sentence went to new line text extraction treat it as "enter" (\n)
+- the titles of image comes to the top, than actual content starts
+- I noticed that the paragraph titles are grouped at the bottom of the extracted text per page and the content comes before that, so all contents than all the titles for each page, why the sequence is changed after extraction?
+- few logics to seperate paragraphs
+	* look for the combination like ".\n" -> this may fail if the sentence completes in the middle of paragraph but also completing the line in pdf.
+	* we can also measure the avg lengths of the lines if ".\n" combination fall +/- 5 char than it is continuos paragraph --> but than this will also mark the continuos paragraph if the last line of the para is ending near the avg len of line.
+	* I see that in the actual pdf there is more line space between two paragraph, can we extract the line space info from pdf, that would be great help for para chunking
+	* in the doc references are given like [2], and than have list at the end of the doc. so this for sure not be linked with reference when we do the para chunking.
+	* extraction somehow separating the titles or heading if it is somehow on the right place we can do better chunking with tag of title. 
+	* if we took the individual chunk from the middle, can not say anything about the intent of the document, we need to somehow keep taging the chunks like switchgear, components, insulating medium or something which contineuously link the chunk with higher level.
+
+Personal discovery: Isolated chunks lose document-level context. A chunk about "SF6 pressure" doesn't know it belongs to a document about "GIS switchgear maintenance". 
+
+Solution direction: Tag every chunk with its parent section, parent document, and document purpose. This is called 
+hierarchical indexing.
+
+This is apparently why GraphRAG exists — I discovered the problem before reading the solution.
+
+Day 3 complete.
+
+## Chunking — Complete Learning Log
+
+### Problem 1: Wrong PDF Parsing Library
+**Observed:** pypdf extracted text in wrong sequence. Paragraph titles were grouping at the bottom, image captions appearing at top. Reading order was broken.
+
+**Root cause:** pypdf reads PDF objects in storage order, not visual reading order.
+
+**Solution:** Switched to pdfplumber which extracts text with coordinates — x0, y0, x1, y1 — giving us exact position of every word on the page.
+
+**Lesson:** Library choice directly affects data quality. Understanding what your library actually does matters before writing any logic on top of it.
+
+### Problem 2: Fixed Size Chunking Breaks Meaning
+**Observed:** chunk_size=500 with overlap=50 was cutting sentences mid-thought. A fact about SF6 pressure could be split across two chunks. Neither chunk carried the complete meaning.
+
+**Root cause:** Fixed character counting has no awareness of sentence or paragraph boundaries.
+
+**Solution:** Moved to layout-aware chunking using line spacing detected from pdfplumber coordinates.
+
+**Lesson:** Chunk boundaries should follow meaning boundaries, not character counts.
+
+### Problem 3: Paragraph Detection Using \n\n Failed
+**Observed:** Extracted text had no double newlines anywhere. Single \n was used for everything — new lines within a paragraph, between paragraphs, after headings — all looked identical in raw text.
+
+**Root cause:** pdfplumber extracts words with coordinates, not formatted text. Whitespace structure of the original PDF is lost.
+
+**Solution:** Used vertical gap between consecutive lines (gap_above, gap_below) as paragraph signal instead of newline characters.
+
+**Discovered thresholds from real data:**
+```
+Normal line spacing:     ~16px  → same paragraph, continue
+Gap > 20px (one side)   → new paragraph boundary
+Gap > 30px (both sides) → section heading
+```
+
+**Lesson:** Never assume text formatting survives extraction. Go back to raw data and find the real signal.
+
+---
+
+### Problem 4: Section Detection Was Inaccurate
+**Observed:** First line of paragraphs were being incorrectly tagged as section headers. Sections were misidentified throughout.
+
+**Root cause:** Initial detection logic only checked gap on one side. A paragraph starting after a large gap looks identical to a section heading if you only check gap_above.
+
+**Your insight:** Main header has large gap on bottom side only (no content above it). Sections have large gap on top AND the line above has larger font than body text.
+
+**Solution:** Two-condition detection:
+```
+Main header: first line in document where gap_below > 30
+Section: gap_above > 30 AND previous line font > body font size
+```
+
+**Lesson:** When a rule produces wrong results, look at the data around known correct examples. The diagnostic function showing 3 lines of context around a known heading revealed the exact signal needed.
+
+---
+
+### Problem 5: Text Skipping in Split Sections
+**Observed:** Large sections split into part 1 and part 2 did not connect smoothly. Text from the original PDF was missing between parts.
+
+**Root cause:** Character position drift. The old split logic used `rfind('.')` to find a nearby sentence boundary, which shifted the `end` position of each part. The next part started from a drifted position. Over multiple splits the drift compounded into gaps.
+
+**Solution:** Sentence-first approach. Instead of tracking character positions:
+```
+Step 1: Split entire section text into sentences first
+Step 2: Walk sentences one by one
+Step 3: Fill current part until max_size reached
+Step 4: Save part, start next part with next sentence
+```
+
+No character position tracking. No drift possible.
+
+**Lesson:** When splitting text, always work at semantic boundaries — sentences or paragraphs — never arbitrary character positions. Position tracking accumulates errors.
+
+---
+
+### Final Chunk Structure Achieved
+Every chunk now carries:
+```json
+{
+  "chunk_id": 12,
+  "page_num": 3,
+  "header": "Gas-insulated switchgear",
+  "section": "Components",
+  "text": "The SF6 gas serves as both insulating..."
+}
+```
+
+**What this unlocks:** When the system answers a question, it can show the user exactly where the answer came from — document → section → page. This is called **provenance**. It's what separates a trustworthy RAG system from a black box.
+
+---
+
+### What You Demonstrated Today
+
+You did not follow a tutorial. You:
+
+- Looked at raw data before writing any code
+- Derived thresholds from real observations not assumptions
+- Caught a library limitation and diagnosed its root cause
+- Proposed all three major architectural decisions yourself
+- Found the split bug by reading output, not by reading code
+
+That is how production systems get built.
+
+---
+
+Day 4 tomorrow — embeddings. You'll watch meaning turn into numbers and verify with your own eyes that similar text produces similar vectors.
+
+Day 4
+Embedding Model Comparison — Personal Experiment
+
+Test sentences designed to probe:
+- S1 vs S2: Same domain, different framing (GIS R&D)
+- S1 vs S3: Completely unrelated (bonsai)
+- S1 vs S4: Same person's world, different domain (trading)
+
+Results:
+                    nomic       qwen3-0.6b
+S1 vs S2 (same):   0.6752      0.6460
+S1 vs S3 (unrela): 0.3989      0.2864
+S1 vs S4 (diff):   0.5304      0.2625
+
+Key observation:
+nomic scored S1 vs S4 at 0.53 — it found similarity 
+between GIS R&D and trading sentences.
+
+qwen scored S1 vs S4 at 0.26 — it treated them as 
+mostly unrelated.
+
+My hypothesis:
+nomic is capturing intent/context (both sentences are 
+about "professional analysis requiring systematic approach")
+qwen is capturing domain vocabulary more strictly
+(GIS terms vs trading terms = different)
+
+Decision: nomic for APEX2
+Reason: For a RAG system answering engineering questions,
+intent-matching is more valuable than domain-matching.
+A user asking "how do I validate my design?" should match
+"design validation protocols" even if exact words differ.
+
+Bonus experiment confirmed: both models returned same 
+top 3 chunks in same order for GIS insulation question.
+This means chunking quality is good — signal is strong 
+enough that model choice doesn't affect retrieval here.
+
+Insight: Embedding model selection depends on use case.
+Intent-matching models → better for natural language Q&A
+Domain-matching models → better for exact terminology search
+For APEX2: intent-matching wins.
+
+with this experiments I have decided to keep the threshold of 0.6 for the retrieval of chunks, as below that may be the intent are maching but not directly relavant to the query. 
+
+Version mismatch lesson: qdrant_client >= 1.7 uses 
+query_points() not search(). Always check library 
+changelog when AttributeError says method doesn't exist.
+
+Qdrant local mode = single connection only.
+Rule: create client once, pass it as parameter.
+Never open two clients pointing at same storage folder.
+If concurrent access needed → use Qdrant server mode.
+
+Personal insight - Cosine vs L2:
+
+Cosine measures angle only, ignores vector magnitude.
+L2 measures actual distance in vector space.
+
+Real example from my own experiment:
+Question: "What precaution to be taken working with switchgear?"
+
+Cosine result 3: Introduction chunk — talks about switchgear 
+protecting the grid. Vectors point same direction (both about 
+switchgear safety context) but the meaning drifts.
+
+L2 result 3: Safety part 2 — directly about precautions near 
+installed switchgear. More semantically precise.
+
+Why this happened:
+The introduction chunk may have similar directional language 
+(fault protection, safety of grid) which aligns the angle —
+but L2 penalized it because the actual vector distance was 
+larger than the safety chunk.
+
+My hypothesis for when each works better:
+- Cosine → better when document length varies greatly
+  (short chunks vs long chunks in same collection)
+- L2 → better when chunks are similar length and 
+  you need precise semantic proximity
+
+The real answer: neither is always better.
+It depends on your data distribution.
+This needs experimentation per use case.
+
+Next step: test with more questions to see if L2 
+consistently outperforms cosine for safety/procedural 
+questions in engineering documents.
+
+Cosine vs L2 - Final Findings From My Data:
+
+L2 wins for: Procedural and fault-condition questions
+"What happens during fault?" → L2 gave better chunk order
+Reason: Physical proximity in vector space better captures 
+step-by-step procedural similarity.
+
+Cosine wins for: Conceptual and alternative-seeking questions  
+"Is SF6 harmful, any alternative?" → Cosine found the 
+alternatives chunk correctly. L2 found SF6 alarm chunk —
+related domain but wrong intent.
+Reason: Cosine captures directional intent better. 
+"SF6 harmful + alternative" has a specific semantic 
+direction that cosine preserved.
+
+Neither wins universally. It depends on question type.
+
+Production decision for APEX2:
+Start with cosine at threshold 0.6.
+This is the safer default for a general Q&A system where 
+users ask conceptual questions more than procedural ones.
+Revisit if users report poor results on procedural queries.
+
+Deeper insight:
+The right long-term solution is Hybrid Search —
+run both metrics, merge results intelligently.
+This is called Reciprocal Rank Fusion (RRF).
+Flag for Week 2 implementation.
+
+Day 5 — LLM Layer + Critical Lessons
+
+WHAT I BUILT:
+Full RAG pipeline closes today.
+Question → embedding → Qdrant retrieval → 
+prompt with context → LLM answer → sources shown
+
+LESSON 1 — Ollama needs separate terminal:
+ollama serve must run as background service.
+Two terminals always: one for serve, one for code.
+
+LESSON 2 — Temperature controls consistency:
+temp=0.8 (default) → variable length, varied structure
+temp=0.2 → consistent, precise, repeatable
+Engineering Q&A needs low temperature.
+num_predict=300 caps response length.
+
+LESSON 3 — Hallucination: Knowledge Bleed
+Most important discovery of the week.
+
+What happened: Asked "is SF6 harmful to environment?"
+LLM answered with "25x more potent than CO2 over 100 
+years" — numbers not in the document. Pulled from 
+training data and mixed into answer.
+
+I caught it because of my domain knowledge.
+SF6 is actually 23,000x more potent than CO2.
+The model's number was also wrong.
+
+Fix: Explicit prompt instruction —
+"Do not use any knowledge from your training"
+"Use ONLY exact information present in context"
+
+Result: Hallucination disappeared. Answer now says 
+only what document says, then adds "document does not 
+provide further detail."
+
+Why this matters for production:
+Wrong numbers in engineering documents = real danger.
+Wrong pressure rating, wrong safety threshold, 
+wrong specification = equipment failure or injury.
+
+LESSON 4 — Small model limitation:
+qwen2.5:1.5b struggles with strict instruction following.
+Known tradeoff: small = fast but less reliable.
+Production fix: upgrade to 7b+ model when hardware allows.
+Or add faithfulness verification layer.
+
+CURRENT KNOWN LIMITATIONS:
+1. Bullet points appear as continuous text
+2. Occasional knowledge bleed with weak prompts  
+3. 1.5b model less reliable than 7b+
+4. Single document only — no multi-document search yet
+5. No conversation memory — each question is independent
+
+
+Day 7 — Streamlit UI
+
+New concept: Session State
+Streamlit reruns entire script on every interaction.
+Session state persists data between reruns.
+Without it: client resets every question = slow.
+With it: client built once, reused every question.
+
+What "No data leaves your laptop" means:
+- PDF processed locally by pdfplumber
+- Embeddings computed by Ollama locally
+- Vectors stored in local qdrant_storage folder
+- LLM runs locally via Ollama
+- No API calls to OpenAI, no cloud, no internet needed
+
+This is the core product promise of APEX2.
+
+Week 1 Final Observation:
+
+APEX2 works but chunking is overfitted to one document.
+Thresholds (gap 20, 32, 44px) are specific to 
+Wikipedia GIS PDF layout.
+
+Different publishers = different layouts = wrong thresholds.
+
+This is the core unsolved problem for Week 2.
+
+Possible solutions to explore:
+1. Auto-threshold detection — analyze each PDF's own 
+   spacing distribution before chunking
+2. Relative thresholds — use percentiles of the 
+   document's own gap distribution instead of 
+   fixed pixel values
+3. Fallback chunker — if layout detection fails,
+   fall back to sentence-based chunking
+4. Multiple chunking strategies — try all three,
+   let retrieval quality decide which worked better
+
+day 8
+APEX2 Universal Chunker — Specification
+
+Test corpus: 20 documents across 5 categories
+Layout types: S1(15), S2(1), PPT(1), MIX(2), COMPLEX(1)
+
+Target quality metrics:
+- S1 documents: >85% sections correctly identified
+- S2 documents: columns separated cleanly
+- Legal: numbering hierarchy preserved
+- Tables: extracted separately, headers preserved
+- Complex/PPT: graceful degradation with confidence flag
+
+Out of scope (explicitly):
+- Scanned PDFs
+- Right-to-left languages  
+- Extremely complex financial layouts (01_finance)
+- Documents under 3 pages
+
+Success definition:
+"A user can upload any of our 19 in-scope documents
+and get meaningful, retrievable chunks with correct
+section tagging — or an honest confidence warning
+if the document is too complex."
+
+analysis of 01_arxiv.pdf
+histogram - 10 font size is dominant - it is body text, than going to larger 12 font size is of headers/section, also the subsection are only having the bolt letters and font size is same as body text. the doc has equation also, which is with smaller font size
+histogram - 11 line spacing is dominant - it is body text spacing, than there is several other but on the larger side highest 18, 22 and 26 these can be of headers, title, sections. 
+line start x position - one spike at 110-115 is for the common for body text, second spike "bit" shifted is of references
+
+
+
+Day 9
+Learned that if I want to make the requirement.txt for my python code command is as follow
+pip freeze > requirement.txt
+
+
+Critical: nomic-embed-text requires task prefixes
+Chunks:  "search_document: " + chunk["text"]
+Queries: "search_query: "    + question
+
+My current embed_all_chunks() is missing this.
+Fix before integrating docling chunks into Qdrant.
+
+
+Decision: Switched from pdfplumber statistical chunker 
+to Docling for universal PDF chunking.
+
+Why this is the right decision:
+- Statistical approach requires per-document threshold tuning
+- Docling uses deep learning layout detection
+- Handles columns, tables, headings as semantic elements
+- IBM open source, production-grade, actively maintained
+
+What I learned from building the statistical chunker:
+- Gap distribution reveals paragraph boundaries
+- Font clustering reveals heading hierarchy
+- X-coordinates reveal column structure
+- These are exactly the signals Docling's model learned from 
+  millions of documents — my statistical approach was 
+  manually approximating what the model learned automatically
+
+What Docling adds that my approach couldn't:
+- True column separation in multi-column layouts
+- Table extraction as structured Markdown
+- Heading hierarchy preserved as breadcrumb list
+- Confidence in diverse document types
+
+nomic-embed-text prefix requirement noted.
+Fix embed pipeline before integration.
+
+
+Week 1 APEX2 chunker:
+- pdfplumber based
+- Your thresholds, your logic
+- Works on your GIS Wikipedia doc
+- Fails on multi-column, tables, complex layouts
+
+Week 2 Docling chunker:
+- Deep learning layout detection
+- Handles all 20 of your test documents
+- Tables as Markdown
+- Heading hierarchy preserved
+- Double column correctly separated
+- 135-page IEC standard processed successfully
+
+Quality delta: massive improvement
+Understanding delta: zero — you understand why
+
+Docling Integration — Test Results
+
+Chunking quality: Excellent across all document types
+Double column: 100% correct — major win
+Tables: Markdown format, LLM understands correctly
+Processing: 3-6 seconds per page, acceptable for indexing
+
+512 tokens = ~2048 chars — working as designed
+nomic-embed-text sweet spot confirmed at 512 tokens
+
+Issues found and fixed:
+1. Noise chunks from index/foreword/TOC — add to filter
+2. nomic prefix missing in embed pipeline — fix required
+3. Page numbers are PDF-internal not printed — document as known limitation
+4. Large documents need progress feedback in UI
+
+Key insight: Statistical chunker taught me WHY 
+universal chunking is hard. Docling solves it with 
+deep learning layout detection trained on millions 
+of documents — the same signals I identified 
+(gaps, fonts, x-positions) but learned from data 
+not hardcoded rules.
+
+This is the right abstraction level for production.
+
+
+Three bugs fixed today:
+
+1. chunk_id: added as len(chunks) during record creation
+   Auto-increments naturally, no counter needed
+
+2. Text flattening: clean_text now uses [ \t]+ pattern
+   Preserves \n paragraph structure
+   Added preview_chunks() for human verification
+
+3. Architecture decision: separate chunk files per document
+   Reason: enables caching, incremental updates, 
+   per-document re-indexing without full rebuild
+   
+   Qdrant strategy: one collection, filter by source field
+   Gives both multi-doc search and single-doc search
+   
+4. nomic prefix implemented properly:
+   Indexing: "search_document: " + chunk text
+   Querying: "search_query: "    + question
+   is_query parameter controls which prefix to use
+
+5. global_id in build_index prevents chunk_id 
+   collision when multiple documents are indexed
+
+
+Known limitation: Mathematical equations
+Cause: PDF equation rendering loses structure during extraction
+Impact: Formula answers are incomplete or malformatted
+Workaround: None currently — document as known limitation
+Future fix: MathPix API or specialized equation OCR
