@@ -6,6 +6,7 @@ from qdrant_client.models import (
 from pathlib import Path
 import ollama
 import json
+import datetime
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -16,6 +17,51 @@ EMBEDDING_MODEL = "nomic-embed-text"
 THRESHOLD       = 0.6
 TOP_K           = 3
 VECTOR_SIZE     = 768
+REGISTRY_PATH = Path("doc_registry.json")
+
+# ─────────────────────────────────────────────────────────────
+# REGISTRY HELPERS
+# Tracks which PDFs are indexed across sessions
+# ─────────────────────────────────────────────────────────────
+
+def load_registry() -> dict:
+    """Loads doc_registry.json. Returns empty registry if not found."""
+    if REGISTRY_PATH.exists():
+        with open(REGISTRY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {"documents": []}
+
+
+def save_registry(registry: dict):
+    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False)
+
+
+def add_to_registry(filename: str, chunk_count: int):
+    registry = load_registry()
+    existing = [d["filename"] for d in registry["documents"]]
+    if filename not in existing:
+        registry["documents"].append({
+            "filename":    filename,
+            "indexed_at":  datetime.datetime.now().isoformat(timespec="seconds"),
+            "chunk_count": chunk_count,
+            "status":      "indexed"
+        })
+        save_registry(registry)
+
+
+def remove_from_registry(filename: str):
+    registry = load_registry()
+    registry["documents"] = [
+        d for d in registry["documents"]
+        if d["filename"] != filename
+    ]
+    save_registry(registry)
+
+
+def get_indexed_docs() -> list[dict]:
+    return load_registry().get("documents", [])
+
 
 
 # ─────────────────────────────────────────
@@ -286,7 +332,8 @@ def ask(question, client, source_filter=None, multi_sources=None,
     prompt = f"""You are a document retrieval assistant.
 Your ONLY job is to answer using the document context provided.
 
-{history_block}STRICT RULES:
+{history_block}
+STRICT RULES:
 - Use ONLY the exact information present in the context below
 - Do not use any knowledge from your training
 - If a specific detail is not in the context, say so explicitly

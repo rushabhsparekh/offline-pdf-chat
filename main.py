@@ -11,14 +11,14 @@ sys.path.append(os.path.dirname(__file__))
 from pdf_to_json import build_converter, build_chunker, pdf_to_chunks
 from retrieve import (
     ensure_collection, index_document, remove_document,
-    search, ask, get_embedding, COLLECTION_NAME
+    search, ask, get_embedding, COLLECTION_NAME, load_registry, save_registry,
+    add_to_registry, remove_from_registry, get_indexed_docs,
 )
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-REGISTRY_PATH  = Path("doc_registry.json")
 CHUNKS_DIR     = Path("chunks")
 PDFS_DIR       = Path("pdfs")
 CHAT_LOGS_DIR  = Path("chat_logs")
@@ -65,50 +65,6 @@ def get_qdrant_client():
     client = QdrantClient(path="qdrant_storage")
     ensure_collection(client)
     return client
-
-
-# ─────────────────────────────────────────────────────────────
-# REGISTRY HELPERS
-# Tracks which PDFs are indexed across sessions
-# ─────────────────────────────────────────────────────────────
-
-def load_registry() -> dict:
-    """Loads doc_registry.json. Returns empty registry if not found."""
-    if REGISTRY_PATH.exists():
-        with open(REGISTRY_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    return {"documents": []}
-
-
-def save_registry(registry: dict):
-    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
-        json.dump(registry, f, indent=2, ensure_ascii=False)
-
-
-def add_to_registry(filename: str, chunk_count: int):
-    registry = load_registry()
-    existing = [d["filename"] for d in registry["documents"]]
-    if filename not in existing:
-        registry["documents"].append({
-            "filename":    filename,
-            "indexed_at":  datetime.datetime.now().isoformat(timespec="seconds"),
-            "chunk_count": chunk_count,
-            "status":      "indexed"
-        })
-        save_registry(registry)
-
-
-def remove_from_registry(filename: str):
-    registry = load_registry()
-    registry["documents"] = [
-        d for d in registry["documents"]
-        if d["filename"] != filename
-    ]
-    save_registry(registry)
-
-
-def get_indexed_docs() -> list[dict]:
-    return load_registry().get("documents", [])
 
 
 # ─────────────────────────────────────────────────────────────
