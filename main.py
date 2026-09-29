@@ -1,17 +1,17 @@
 import streamlit as st
 from pathlib import Path
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+import hashlib
 import json
 import sys
 import os
 import datetime
 
 sys.path.append(os.path.dirname(__file__))
-from pdf_to_json import build_converter, build_chunker, pdf_to_chunks
+from pdf_to_json import build_converter, build_chunker, pdf_to_chunks, MAX_TOKENS
 from retrieve import (
-    ensure_collection, index_document, remove_document,
-    search, ask, get_embedding, COLLECTION_NAME
+    ensure_collection, index_document, remove_document, is_indexed,
+    ask, LLM_CTX_WINDOW
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -22,7 +22,6 @@ REGISTRY_PATH  = Path("doc_registry.json")
 CHUNKS_DIR     = Path("chunks")
 PDFS_DIR       = Path("pdfs")
 CHAT_LOGS_DIR  = Path("chat_logs")
-LLM_CTX_WINDOW = 4096   # qwen2.5:1.5b context window
 
 
 # ─────────────────────────────────────────────────────────────
@@ -111,6 +110,33 @@ def get_indexed_docs() -> list[dict]:
     return load_registry().get("documents", [])
 
 
+def sync_registry_with_index(client):
+    """
+    Drops registry entries whose vectors are no longer in Qdrant
+    (e.g. qdrant_storage/ was deleted, or indexing crashed midway).
+    Qdrant is the source of truth for what is searchable.
+    """
+    registry = load_registry()
+    docs     = registry.get("documents", [])
+    kept     = [d for d in docs if is_indexed(d["filename"], client)]
+    if len(kept) != len(docs):
+        registry["documents"] = kept
+        save_registry(registry)
+
+
+def delete_document(filename: str, client):
+    """Removes a document's vectors, registry entry and cached chunks."""
+    remove_document(filename, client)
+    remove_from_registry(filename)
+    cp = CHUNKS_DIR / (Path(filename).stem + "_chunks.json")
+    if cp.exists():
+        cp.unlink()
+
+
+def file_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 # ─────────────────────────────────────────────────────────────
 # CHAT LOG HELPERS
 # ─────────────────────────────────────────────────────────────
@@ -140,20 +166,43 @@ def approx_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def estimate_context_usage(chat_history: list) -> tuple[int, int]:
+def estimate_context_usage(chat_history: list, context_turns: int,
+                           top_k: int) -> tuple[int, int]:
     """
-    Estimates tokens used by last 3 chat exchanges + overhead.
-    Returns (used_tokens, total_available).
+    Estimates prompt tokens for the next question, using the same
+    history window and top-k that ask() will use.
+    Chunks are counted at their worst-case size (MAX_TOKENS each).
+    Returns (used_tokens, total_available) — used may exceed total.
     """
-    recent        = chat_history[-6:]   # last 3 Q+A pairs
+    recent        = chat_history[-(context_turns * 2):] if context_turns > 0 else []
     history_toks  = sum(
         approx_tokens(m.get("content", "") + m.get("answer", ""))
         for m in recent
     )
     prompt_overhead = 350               # system prompt + formatting
-    chunk_reserve   = 1200              # reserved for retrieved chunks
+    chunk_reserve   = top_k * MAX_TOKENS
     used            = history_toks + prompt_overhead + chunk_reserve
-    return min(used, LLM_CTX_WINDOW), LLM_CTX_WINDOW
+    return used, LLM_CTX_WINDOW
+
+
+# ─────────────────────────────────────────────────────────────
+# SOURCES DISPLAY
+# ─────────────────────────────────────────────────────────────
+
+def render_sources(sources: list):
+    with st.expander(f"📚 Sources — {len(sources)} chunks used"):
+        for i, src in enumerate(sources):
+            headings   = src.get("headings", [])
+            breadcrumb = " > ".join(headings) if headings else "—"
+            pages      = src.get("page", [])
+            page_str   = ", ".join(str(p) for p in pages) if pages else "?"
+
+            st.markdown(
+                f"**{i+1}.** `{src.get('source','?')}` "
+                f"— p.{page_str} "
+                f"— score `{src['score']}`"
+            )
+            st.caption(f"📍 {breadcrumb}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -180,6 +229,11 @@ with st.spinner("Loading document AI models — one time only..."):
     converter, chunker = load_docling_models()
 
 client = get_qdrant_client()
+
+if "registry_synced" not in st.session_state:
+    sync_registry_with_index(client)
+    st.session_state.registry_synced = True
+
 indexed_docs = get_indexed_docs()
 
 
@@ -203,22 +257,38 @@ with st.sidebar:
     )
 
     if uploaded_file:
-        pdf_path      = PDFS_DIR / uploaded_file.name
+        filename      = Path(uploaded_file.name).name   # strip any path parts
+        pdf_path      = PDFS_DIR / filename
         chunk_path    = CHUNKS_DIR / (pdf_path.stem + "_chunks.json")
-        already_done  = chunk_path.exists()
+        pdf_bytes     = uploaded_file.getvalue()
 
-        with open(pdf_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+        # Same name on disk but different content → cached chunks are stale
+        on_disk_same  = (
+            pdf_path.exists()
+            and file_sha256(pdf_path.read_bytes()) == file_sha256(pdf_bytes)
+        )
+        replacing     = pdf_path.exists() and not on_disk_same
+        already_done  = chunk_path.exists() and on_disk_same
 
         if already_done:
-            st.info(f"Already processed — click Index to add to search.")
+            st.info("Already processed — click Index to add to search.")
+        elif replacing:
+            st.warning(
+                f"A different file named {filename} is already in the "
+                "library — indexing will replace it."
+            )
         else:
-            st.success(f"Uploaded: {uploaded_file.name}")
+            st.success(f"Uploaded: {filename}")
 
         if st.button("⚡ Index Document", use_container_width=True):
 
             # Step 1 — Chunk (skip if cached)
             if not already_done:
+                # Clear any stale vectors/chunks stored under this name
+                delete_document(filename, client)
+                with open(pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+
                 with st.spinner("Processing PDF with Docling..."):
                     chunks = pdf_to_chunks(
                         str(pdf_path), converter, chunker
@@ -231,10 +301,10 @@ with st.sidebar:
 
             # Step 2 — Embed & index this document only
             with st.spinner("Embedding and indexing..."):
-                count = index_document(pdf_path.stem, client)
+                count = index_document(filename, client)
 
-            add_to_registry(uploaded_file.name, count)
-            st.session_state.current_doc = uploaded_file.name
+            add_to_registry(filename, count)
+            st.session_state.current_doc = filename
 
             # Refresh indexed docs list
             indexed_docs = get_indexed_docs()
@@ -260,15 +330,7 @@ with st.sidebar:
                 if st.button("✕", key=f"remove_{doc['filename']}",
                              help=f"Remove {doc['filename']}"):
                     with st.spinner(f"Removing {doc['filename']}..."):
-                        remove_document(doc["filename"], client)
-                        remove_from_registry(doc["filename"])
-
-                        # Also delete chunk file
-                        cp = CHUNKS_DIR / (
-                            Path(doc["filename"]).stem + "_chunks.json"
-                        )
-                        if cp.exists():
-                            cp.unlink()
+                        delete_document(doc["filename"], client)
 
                     st.success(f"Removed {doc['filename']}")
                     indexed_docs = get_indexed_docs()
@@ -300,16 +362,26 @@ with st.sidebar:
     st.markdown("---")
 
     # ── Context Window Indicator ──────────────────────────────
-    used, total = estimate_context_usage(st.session_state.chat_history)
+    # Slider values live in session_state (keys below) — read them here
+    # so the estimate matches the settings the next question will use
+    used, total = estimate_context_usage(
+        st.session_state.chat_history,
+        st.session_state.get("context_turns", 3),
+        st.session_state.get("top_k", 3),
+    )
     pct         = int((used / total) * 100)
-    color       = "normal" if pct < 70 else "inverse"
 
     st.markdown("### Context Window")
     st.progress(
-        pct / 100,
-        text=f"{used} / {total} tokens ({pct}%)"
+        min(pct, 100) / 100,
+        text=f"~{used} / {total} tokens ({pct}%)"
     )
-    if pct >= 80:
+    if pct > 100:
+        st.error(
+            "Prompt may exceed the model's context window and be truncated. "
+            "Lower top-k or history turns, or start a new chat."
+        )
+    elif pct >= 80:
         st.warning("Context nearly full — start a new chat to reset.")
 
     st.markdown("---")
@@ -363,24 +435,28 @@ with st.sidebar:
 
         temperature = st.slider(
             "Temperature",
+            key="temperature",
             min_value=0.0, max_value=1.0,
             value=0.2, step=0.05,
             help="Higher = more creative. Lower = more consistent."
         )
         threshold = st.slider(
             "Retrieval threshold",
+            key="threshold",
             min_value=0.3, max_value=0.9,
             value=0.6, step=0.05,
             help="Minimum similarity score to include a chunk."
         )
         top_k = st.slider(
             "Chunks to retrieve (top-k)",
+            key="top_k",
             min_value=1, max_value=8,
             value=3, step=1,
             help="More chunks = more context but slower."
         )
         context_turns = st.slider(
             "Chat history turns to include",
+            key="context_turns",
             min_value=0, max_value=6,
             value=3, step=1,
             help="How many previous Q&A pairs to send to the LLM."
@@ -430,19 +506,7 @@ for message in st.session_state.chat_history:
 
             sources = message.get("sources", [])
             if sources:
-                with st.expander(f"📚 Sources — {len(sources)} chunks used"):
-                    for i, src in enumerate(sources):
-                        headings   = src.get("headings", [])
-                        breadcrumb = " > ".join(headings) if headings else "—"
-                        pages      = src.get("page", [])
-                        page_str   = ", ".join(str(p) for p in pages) if pages else "?"
-
-                        st.markdown(
-                            f"**{i+1}.** `{src.get('source','?')}` "
-                            f"— p.{page_str} "
-                            f"— score `{src['score']}`"
-                        )
-                        st.caption(f"📍 {breadcrumb}")
+                render_sources(sources)
 
 # ── Chat input ────────────────────────────────────────────────
 
@@ -487,19 +551,7 @@ if question:
 
         sources = result.get("sources", [])
         if sources:
-            with st.expander(f"📚 Sources — {result['chunks_used']} chunks used"):
-                for i, src in enumerate(sources):
-                    headings   = src.get("headings", [])
-                    breadcrumb = " > ".join(headings) if headings else "—"
-                    pages      = src.get("page", [])
-                    page_str   = ", ".join(str(p) for p in pages) if pages else "?"
-
-                    st.markdown(
-                        f"**{i+1}.** `{src.get('source','?')}` "
-                        f"— p.{page_str} "
-                        f"— score `{src['score']}`"
-                    )
-                    st.caption(f"📍 {breadcrumb}")
+            render_sources(sources)
         else:
             st.warning(
                 "No relevant content found above the confidence threshold. "
