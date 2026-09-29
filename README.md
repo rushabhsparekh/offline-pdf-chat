@@ -256,6 +256,7 @@ offline-pdf-chat/
 ├── tokenizer.py     # One-time nomic tokenizer cache setup
 ├── requirements.txt
 ├── requirements-dev.txt
+├── LICENSE
 ├── tests/           # pytest suite (chunk filtering, indexing, search, ask)
 ├── chunks/          # Generated chunk JSON files (gitignored)
 ├── pdfs/            # Uploaded PDFs (gitignored)
@@ -301,3 +302,9 @@ Key discoveries made through observation before reading about them:
 | LLM | qwen2.5:1.5b via Ollama |
 | UI | Streamlit |
 | Language | Python 3.11 |
+
+---
+
+## License
+
+[MIT](LICENSE)
