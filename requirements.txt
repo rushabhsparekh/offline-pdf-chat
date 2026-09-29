@@ -1,0 +1,8 @@
+# Direct dependencies only — pip resolves the rest.
+# Versions are the ones the app was developed and tested with.
+docling==2.104.0
+docling-core==2.83.1
+ollama==0.6.2
+qdrant-client==1.18.0
+streamlit==1.58.0
+transformers==5.9.0

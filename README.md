@@ -1,6 +1,6 @@
 # APEX2 — Offline Document AI
 
-> Ask questions across your confidential documents. Runs entirely on your laptop. No internet required. No data uploaded anywhere.
+> Ask questions across your confidential documents. Runs entirely on your laptop. No internet required after a one-time setup. No data uploaded anywhere.
 
 Built for engineers, analysts, and researchers who work with documents they cannot share with cloud services.
 
@@ -188,6 +188,11 @@ The chunking pipeline was validated on 20 documents across 5 categories:
 
 ## Installation
 
+Setup is the only step that needs internet: it downloads Python packages, the
+Ollama models, the nomic tokenizer, and Docling's layout/table models (fetched
+automatically the first time a PDF is processed). After that, everything runs
+offline.
+
 ```bash
 # Clone repository
 git clone https://github.com/rushabhsparekh/offline-pdf-chat.git
@@ -221,8 +226,22 @@ Open `http://localhost:8501` in your browser.
 **AMD GPU acceleration (RX 560X and similar):**
 ```bash
 # Set before running ollama serve
-set OLLAMA_VULKAN=1
+set OLLAMA_VULKAN=1          # Windows (cmd)
+$env:OLLAMA_VULKAN=1         # Windows (PowerShell)
+export OLLAMA_VULKAN=1       # macOS / Linux
 ollama serve
+```
+
+---
+
+## Tests
+
+The tests use an in-memory Qdrant and mock Ollama, so they need neither
+Ollama running nor Docling's models:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ---
@@ -236,6 +255,9 @@ offline-pdf-chat/
 ├── pdf_to_json.py   # Docling PDF chunker
 ├── tokenizer.py     # One-time nomic tokenizer cache setup
 ├── requirements.txt
+├── requirements-dev.txt
+├── LICENSE
+├── tests/           # pytest suite (chunk filtering, indexing, search, ask)
 ├── chunks/          # Generated chunk JSON files (gitignored)
 ├── pdfs/            # Uploaded PDFs (gitignored)
 ├── models/          # Cached tokenizer (gitignored)
@@ -280,3 +302,9 @@ Key discoveries made through observation before reading about them:
 | LLM | qwen2.5:1.5b via Ollama |
 | UI | Streamlit |
 | Language | Python 3.11 |
+
+---
+
+## License
+
+[MIT](LICENSE)

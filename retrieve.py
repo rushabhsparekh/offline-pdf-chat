@@ -6,6 +6,7 @@ from qdrant_client.models import (
 from pathlib import Path
 import ollama
 import json
+import uuid
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -13,14 +14,26 @@ import json
 
 COLLECTION_NAME = "apex2_gis"
 EMBEDDING_MODEL = "nomic-embed-text"
+LLM_MODEL       = "qwen2.5:1.5b"
+LLM_CTX_WINDOW  = 4096   # num_ctx sent to Ollama — prompt is truncated beyond this
 THRESHOLD       = 0.6
 TOP_K           = 3
 VECTOR_SIZE     = 768
+EMBED_BATCH     = 32     # chunks per ollama.embed call
 
 
 # ─────────────────────────────────────────
 # EMBEDDING
 # ─────────────────────────────────────────
+
+def get_embeddings(texts):
+    """
+    Converts a list of texts to embedding vectors in one Ollama call.
+    Caller is responsible for the nomic task prefix.
+    """
+    response = ollama.embed(model=EMBEDDING_MODEL, input=texts)
+    return response["embeddings"]
+
 
 def get_embedding(text, is_query=False):
     """
@@ -31,12 +44,15 @@ def get_embedding(text, is_query=False):
     """
     if is_query:
         text = "search_query: " + text
+    return get_embeddings([text])[0]
 
-    response = ollama.embeddings(
-        model=EMBEDDING_MODEL,
-        prompt=text
-    )
-    return response["embedding"]
+
+def point_id_for(source_name, chunk_index):
+    """
+    Deterministic point ID for a chunk.
+    uuid5 is stable across runs — Python's hash() is salted per process.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_name}#{chunk_index}"))
 
 
 # ─────────────────────────────────────────
@@ -61,12 +77,29 @@ def ensure_collection(client):
         print(f"Collection created: {COLLECTION_NAME}")
 
 
-def index_document(pdf_stem, client):
+def is_indexed(filename, client):
+    """True if any vector with source == filename exists in Qdrant."""
+    points, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(
+            must=[FieldCondition(
+                key="source",
+                match=MatchValue(value=filename)
+            )]
+        ),
+        limit=1
+    )
+    return bool(points)
+
+
+def index_document(filename, client):
     """
     Indexes ONE document's chunks into the existing collection.
 
-    pdf_stem: filename without extension e.g. "gis_basics"
+    filename: PDF filename exactly as shown in the UI e.g. "gis_basics.pdf"
               (chunk file must exist at chunks/gis_basics_chunks.json)
+              Stored as the "source" payload, so filters and removal
+              match it exactly — including ".PDF" extensions.
 
     Skips silently if this document is already indexed.
     Returns number of chunks indexed (or existing count if skipped).
@@ -77,6 +110,7 @@ def index_document(pdf_stem, client):
     - index_document() adds incrementally — one doc at a time
     - get_qdrant_client() in main.py holds the single connection
     """
+    pdf_stem   = Path(filename).stem
     chunk_file = Path("chunks") / (pdf_stem + "_chunks.json")
     if not chunk_file.exists():
         print(f"Chunk file not found: {chunk_file}")
@@ -89,35 +123,25 @@ def index_document(pdf_stem, client):
         print(f"Empty chunk file: {chunk_file}")
         return 0
 
-    # Check if already indexed — search for any chunk from this source
-    source_name = pdf_stem + ".pdf"
-    already, _  = client.scroll(
-        collection_name=COLLECTION_NAME,
-        scroll_filter=Filter(
-            must=[FieldCondition(
-                key="source",
-                match=MatchValue(value=source_name)
-            )]
-        ),
-        limit=1
-    )
-    if already:
-        print(f"Already indexed: {pdf_stem} — skipping")
+    source_name = filename
+    if is_indexed(source_name, client):
+        print(f"Already indexed: {source_name} — skipping")
         return len(chunks)
 
     # Build and upload points
     points = []
-    print(f"Embedding {len(chunks)} chunks — {pdf_stem}...")
+    print(f"Embedding {len(chunks)} chunks — {source_name}...")
 
-    for i, chunk in enumerate(chunks):
-        text_to_embed = "search_document: " + chunk["text"]
-        embedding     = get_embedding(text_to_embed)
+    embeddings = []
+    for i in range(0, len(chunks), EMBED_BATCH):
+        batch = chunks[i:i + EMBED_BATCH]
+        embeddings.extend(get_embeddings(
+            ["search_document: " + c["text"] for c in batch]
+        ))
 
-        # Use hash-based ID to avoid collisions across documents
-        point_id = abs(hash(f"{pdf_stem}_{i}")) % (2 ** 53)
-
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         point = PointStruct(
-            id=point_id,
+            id=point_id_for(source_name, i),
             vector=embedding,
             payload={
                 "chunk_id": chunk.get("chunk_id", i),
@@ -138,7 +162,7 @@ def index_document(pdf_stem, client):
         )
         print(f"  Uploaded {min(i + 100, len(points))}/{len(points)}")
 
-    print(f"Done — {len(points)} chunks indexed for {pdf_stem}")
+    print(f"Done — {len(points)} chunks indexed for {source_name}")
     return len(points)
 
 
@@ -210,7 +234,7 @@ def search(question, client=None, source_filter=None,
 
     return [{
         "score":    round(r.score, 4),
-        "chunk_id": r.id,
+        "chunk_id": r.payload.get("chunk_id"),
         "text":     r.payload["text"],
         "source":   r.payload.get("source", ""),
         "page":     r.payload.get("page", []),
@@ -300,9 +324,13 @@ Question: {question}
 Answer strictly using only the context above:"""
 
     response = ollama.chat(
-        model="qwen2.5:1.5b",
+        model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        options={"temperature": temperature, "num_predict": 300}
+        options={
+            "temperature": temperature,
+            "num_predict": 300,
+            "num_ctx":     LLM_CTX_WINDOW,
+        }
     )
 
     return {

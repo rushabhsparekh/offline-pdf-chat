@@ -3,9 +3,9 @@ APEX2 — Universal PDF Chunker
 Converts PDF → clean chunk JSON ready for nomic-embed-text + Qdrant.
 
 Usage:
-    python pdf_chunker.py                        # chunks all PDFs in ./pdfs/
-    python pdf_chunker.py path/to/file.pdf       # single file
-    python pdf_chunker.py path/to/dir/           # all PDFs in a directory
+    python pdf_to_json.py                        # chunks all PDFs in ./pdfs/
+    python pdf_to_json.py path/to/file.pdf       # single file
+    python pdf_to_json.py path/to/dir/           # all PDFs in a directory
 
 Output:
     ./chunks/<filename>_chunks.json  per PDF
@@ -16,33 +16,17 @@ Embedding (run after this):
     Each query should be prefixed with "search_query: " at retrieval time.
 
 One-time setup (run once to cache tokenizer locally, then never again):
-    from transformers import AutoTokenizer
-    AutoTokenizer.from_pretrained("nomic-ai/nomic-embed-text-v1.5").save_pretrained("./models/nomic-tokenizer")
+    python tokenizer.py
+
+Docling and transformers are imported inside build_converter() /
+build_chunker() so the text helpers below can be imported (and tested)
+without loading the ML stack.
 """
 
 import json
 import re
 import sys
 from pathlib import Path
-
-from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-from docling.chunking import HybridChunker
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions,
-    TableFormerMode,
-    TableStructureOptions,
-)
-from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.transforms.chunker.hierarchical_chunker import (
-    ChunkingDocSerializer,
-    ChunkingSerializerProvider,
-)
-from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-from docling_core.transforms.serializer.markdown import MarkdownParams, MarkdownTableSerializer
-from docling_core.types.doc import DocItemLabel
-from transformers import AutoTokenizer
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -53,34 +37,34 @@ MIN_CHUNK_CHARS = 100
 OUTPUT_DIR      = "./chunks"
 
 NOISE_HEADINGS = {
-    "references", 
-    "bibliography", 
+    "references",
+    "bibliography",
     "acknowledgements",
     "acknowledgments",
-    "index",              # add this
-    "foreword",           # add this
-    "preface",            # add this
-    "table of contents",  # add this
-    "contents",           # add this
-    "notational conventions",  # add this
+    "index",
+    "foreword",
+    "preface",
+    "table of contents",
+    "contents",
+    "notational conventions",
 }
 NOISE_PATTERN   = re.compile(r'<!--.*?-->', re.DOTALL)
-
-
-# ── Serializer: Markdown tables, plain text for everything else ───────────────
-
-class MDTableProvider(ChunkingSerializerProvider):
-    def get_serializer(self, doc):
-        return ChunkingDocSerializer(
-            doc=doc,
-            table_serializer=MarkdownTableSerializer(),
-            params=MarkdownParams(compact_tables=True),
-        )
+SECTION_NUMBER  = re.compile(r'^(?:\d+(?:\.\d+)*[.)]?|[ivxlc]+[.)])\s+', re.IGNORECASE)
 
 
 # ── Build converter (call once, reuse across files) ───────────────────────────
 
-def build_converter() -> DocumentConverter:
+def build_converter():
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        TableFormerMode,
+        TableStructureOptions,
+    )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
     opts = PdfPipelineOptions()
     opts.do_ocr                  = False                    # digital PDFs only — biggest speedup
     opts.do_table_structure      = True                     # keep — GIS specs need tables
@@ -108,7 +92,25 @@ def build_converter() -> DocumentConverter:
 
 # ── Build chunker (call once, reuse across files) ─────────────────────────────
 
-def build_chunker() -> HybridChunker:
+def build_chunker():
+    from docling.chunking import HybridChunker
+    from docling_core.transforms.chunker.hierarchical_chunker import (
+        ChunkingDocSerializer,
+        ChunkingSerializerProvider,
+    )
+    from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
+    from docling_core.transforms.serializer.markdown import MarkdownParams, MarkdownTableSerializer
+    from transformers import AutoTokenizer
+
+    # Serializer: Markdown tables, plain text for everything else
+    class MDTableProvider(ChunkingSerializerProvider):
+        def get_serializer(self, doc):
+            return ChunkingDocSerializer(
+                doc=doc,
+                table_serializer=MarkdownTableSerializer(),
+                params=MarkdownParams(compact_tables=True),
+            )
+
     tokenizer = HuggingFaceTokenizer(
         tokenizer=AutoTokenizer.from_pretrained(TOKENIZER_PATH),
         max_tokens=MAX_TOKENS,
@@ -129,28 +131,35 @@ def clean_text(text: str) -> str:
     text = re.sub(r'\r\n', '\n', text)        # normalize line endings
     text = re.sub(r'\n{3,}', '\n\n', text)    # max two consecutive newlines
     text = re.sub(r'[ \t]+', ' ', text)       # collapse spaces/tabs not newlines
-    text = re.sub(r'\[\d+\]', '', text)
+    text = re.sub(r'\[\d+\]', '', text)       # citation markers like [12]
     return text.strip()
- 
+
 
 
 NOISE_LABELS = {"page_header", "page_footer", "picture"}
 
+def normalize_heading(heading: str) -> str:
+    """ "7. References" / "IV References" → "references" """
+    return SECTION_NUMBER.sub("", heading.strip()).strip().lower()
+
+
 def is_noise_chunk(chunk: dict) -> bool:
-    headings_lower = [h.lower() for h in chunk["headings"]]
-    
-    # Existing heading filter
-    if any(h in NOISE_HEADINGS for h in headings_lower):
+    headings = [normalize_heading(h) for h in chunk["headings"]]
+
+    # Chunk sits under a references / contents / index style section
+    if any(h in NOISE_HEADINGS for h in headings):
         return True
-    
+
     # Too short
     if len(chunk["text"].strip()) < MIN_CHUNK_CHARS:
         return True
-    
-    # Noise labels from Docling
-    if any(label in NOISE_LABELS for label in chunk["labels"]):
+
+    # Only noise items from Docling — a chunk that merely contains a
+    # picture alongside real text is kept
+    labels = chunk["labels"]
+    if labels and all(label in NOISE_LABELS for label in labels):
         return True
-    
+
     return False
 
 
@@ -158,8 +167,8 @@ def is_noise_chunk(chunk: dict) -> bool:
 
 def pdf_to_chunks(
     pdf_path: str,
-    converter: DocumentConverter,
-    chunker: HybridChunker,
+    converter,
+    chunker,
     output_dir: str = OUTPUT_DIR,
 ) -> list[dict]:
 
@@ -196,7 +205,7 @@ def pdf_to_chunks(
             item.text
             for item in (meta.doc_items or [])
             if hasattr(item, "label")
-            and item.label == DocItemLabel.CAPTION
+            and item.label.value == "caption"
             and hasattr(item, "text")
         ]
 
@@ -255,16 +264,7 @@ def main():
     print(f"\nDone. {total_chunks} total chunks across {len(pdf_files)} file(s).")
     print(f"Chunk JSONs saved to: {Path(OUTPUT_DIR).resolve()}")
 
-def get_or_create_chunks(pdf_path, converter, chunker):
-    out_path = Path("chunks") / (Path(pdf_path).stem + "_chunks.json")
-    
-    if out_path.exists():
-        print(f"Cache hit — loading existing chunks")
-        with open(out_path) as f:
-            return json.load(f)
-    
-    return pdf_to_chunks(pdf_path, converter, chunker)
-    
+
 def preview_chunks(json_path, how_many=5):
     """
     Human-readable preview of chunk JSON.
